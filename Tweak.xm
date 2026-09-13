@@ -21,31 +21,160 @@
 //
 
 #import "Tweak.h"
+#import "SSPreferences.h"
+#import "SSMovement.h"
+#import "SSDeleteState.h"
+#import <objc/runtime.h>
+
+// The keyboard owns the session; weak references cannot keep an old input view
+// or recognizer alive after a focus change or keyboard dismissal.
+@interface SSCandidateSession : NSObject
+@property (nonatomic, weak) UIPanGestureRecognizer *gesture;
+@property (nonatomic, weak) id inputDelegate;
+@end
+
+@implementation SSCandidateSession
+@end
+
+@interface SSDeleteSession : NSObject {
+@public
+	SSDeleteState state;
+}
+@property (nonatomic, weak) UIKeyboardImpl *keyboard;
+@property (nonatomic, weak) id inputDelegate;
+@property (nonatomic, weak) UITouch *touch;
+@end
+
+@implementation SSDeleteSession
+@end
+
+static id SSCurrentInputDelegate(UIKeyboardImpl *keyboard) {
+	id input = nil;
+	if ([keyboard respondsToSelector:@selector(privateInputDelegate)])
+		input = keyboard.privateInputDelegate;
+	if (!input && [keyboard respondsToSelector:@selector(inputDelegate)])
+		input = keyboard.inputDelegate;
+	return input;
+}
+
+static BOOL SSHasComposition(UIKeyboardImpl *keyboard) {
+	// The input manager knows about composition before WebKit's asynchronous
+	// markedTextRange necessarily catches up with it.
+	if ([keyboard respondsToSelector:@selector(hasMarkedText)] && keyboard.hasMarkedText)
+		return YES;
+	// A web page can replace its DOM value before its marked range catches
+	// up. Also honor an active candidate-selection buffer in the input manager.
+	if ([keyboard respondsToSelector:@selector(inputManagerState)]) {
+		TIKeyboardInputManagerState *state = keyboard.inputManagerState;
+		if ([state respondsToSelector:@selector(usesCandidateSelection)] && state.usesCandidateSelection &&
+			[state respondsToSelector:@selector(inputCount)] && state.inputCount > 0 &&
+			[state respondsToSelector:@selector(inputString)] && state.inputString.length > 0) return YES;
+	}
+	id input = SSCurrentInputDelegate(keyboard);
+	if ([input respondsToSelector:@selector(markedTextRange)]) {
+		UITextRange *range = [input markedTextRange];
+		if (range && !range.empty) return YES;
+	}
+	return NO;
+}
+
+static UIKeyboardImpl *SSKeyboardForLayout(UIKeyboardLayoutStar *layout) {
+	Class keyboardClass = objc_getClass("UIKeyboardImpl");
+	for (UIView *view = layout.superview; view; view = view.superview)
+		if ([view isKindOfClass:keyboardClass]) return (UIKeyboardImpl *)view;
+	UIKeyboardImpl *keyboard = [objc_getClass("UIKeyboardImpl") activeInstance];
+	return [keyboard _layout] == layout ? keyboard : nil;
+}
+
+static void SSClearDeleteSession(UIKeyboardLayoutStar *layout) {
+	SSDeleteSession *session = layout.SS_deleteSession;
+	if (session.keyboard.SS_deleteSession == session) session.keyboard.SS_deleteSession = nil;
+	layout.SS_deleteSession = nil;
+}
+
+static SSDeleteSession *SSCurrentDeleteSession(UIKeyboardImpl *keyboard) {
+	SSDeleteSession *session = keyboard.SS_deleteSession;
+	if (session && (!session.touch || !session.inputDelegate ||
+		session.inputDelegate != SSCurrentInputDelegate(keyboard))) {
+		keyboard.SS_deleteSession = nil;
+		return nil;
+	}
+	return session;
+}
+
+static BOOL SSDeferCandidatesForKeyboard(UIKeyboardImpl *keyboard) {
+	// UI state is inspected only on the main thread. Unrelated/background
+	// requests keep their normal behavior.
+	if (![NSThread isMainThread]) return NO;
+	SSCandidateSession *session = keyboard.SS_candidateSession;
+	UIPanGestureRecognizer *gesture = session.gesture;
+	id input = session.inputDelegate;
+	if (!gesture || !input) return NO;
+	return gesture.state == UIGestureRecognizerStateChanged &&
+		gesture.cancelsTouchesInView && gesture.view == keyboard &&
+		keyboard.window != nil && input == SSCurrentInputDelegate(keyboard);
+}
+
+// Never install a hook under an assumed private signature. Older systems can
+// use the existing no-argument selection-refresh entry point as a fallback.
+static BOOL SSHasNoArgumentMethod(Class cls, SEL selector, BOOL booleanResult) {
+	Method method = class_getInstanceMethod(cls, selector);
+	if (!method || method_getNumberOfArguments(method) != 2) return NO;
+	char returnType[8] = {0};
+	method_getReturnType(method, returnType, sizeof(returnType));
+	return booleanResult ? (returnType[0] == 'B' || returnType[0] == 'c')
+	                     : returnType[0] == 'v';
+}
+
+static BOOL SSHasVoidMethod(Class cls, SEL selector, const char *first, const char *second) {
+	Method method = class_getInstanceMethod(cls, selector);
+	if (!method || method_getNumberOfArguments(method) != 2 + (first != NULL) + (second != NULL)) return NO;
+	NSMethodSignature *signature = [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(method)];
+	return strcmp(signature.methodReturnType, @encode(void)) == 0 &&
+		(!first || strcmp([signature getArgumentTypeAtIndex:2], first) == 0) &&
+		(!second || strcmp([signature getArgumentTypeAtIndex:3], second) == 0);
+}
+
+// Updated only on the main thread, where keyboard gestures are handled.
+static CGFloat ssSwipeSpeed = SS_SPEED_DEFAULT;
+
+static void SSReloadSpeed(void) {
+	ssSwipeSpeed = SSReadSpeed();
+}
+
+static void SSPreferencesDidChange(CFNotificationCenterRef center, void *observer,
+	CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		SSReloadSpeed();
+	});
+}
 
 %hook UIKeyboardImpl
 %property (nonatomic,strong) UIPanGestureRecognizer *SS_pan;
+%property (nonatomic,strong) SSCandidateSession *SS_candidateSession;
+%property (nonatomic,strong) SSDeleteSession *SS_deleteSession;
 
 -(id)initWithFrame:(CGRect)rect {
-	id orig = %orig;
+	UIKeyboardImpl *orig = %orig;
 
-	if (orig) {
-		SSPanGestureRecognizer *pan = [[SSPanGestureRecognizer alloc] initWithTarget:self action:@selector(SS_KeyboardGestureDidPan:)];
+	if (orig && !orig.SS_pan) {
+		SSPanGestureRecognizer *pan = [[SSPanGestureRecognizer alloc] initWithTarget:orig action:@selector(SS_KeyboardGestureDidPan:)];
 		pan.cancelsTouchesInView = NO;
-		[self addGestureRecognizer:pan];
-		[self setSS_pan:pan];
+		[orig addGestureRecognizer:pan];
+		[orig setSS_pan:pan];
 	}
 
 	return orig;
 }
 
 -(instancetype)initWithFrame:(CGRect)arg1 forCustomInputView:(BOOL)arg2 {
-	id orig = %orig;
+	UIKeyboardImpl *orig = %orig;
 
-	if (orig) {
-		SSPanGestureRecognizer *pan = [[SSPanGestureRecognizer alloc] initWithTarget:self action:@selector(SS_KeyboardGestureDidPan:)];
+	if (orig && !orig.SS_pan) {
+		SSPanGestureRecognizer *pan = [[SSPanGestureRecognizer alloc] initWithTarget:orig action:@selector(SS_KeyboardGestureDidPan:)];
 		pan.cancelsTouchesInView = NO;
-		[self addGestureRecognizer:pan];
-		[self setSS_pan:pan];
+		[orig addGestureRecognizer:pan];
+		[orig setSS_pan:pan];
 	}
 
 	return orig;
@@ -53,13 +182,11 @@
 
 %new
 -(void)SS_KeyboardGestureDidPan:(UIPanGestureRecognizer *)gesture {
-	// Location info (may change)
+	// One distance budget for moving, selecting, and WebKit.
 	static UITextRange *startingtextRange = nil;
-	static CGPoint previousPosition;
-
-	// Webview fix
-	static CGFloat xOffset = 0;
-	static CGPoint realPreviousPosition;
+	static UITextPosition *pivotPoint = nil;
+	static CGPoint previousTranslation;
+	static SSMovement movement;
 
 	// Basic info
 	static BOOL shiftHeldDown = NO;
@@ -72,6 +199,7 @@
 	static BOOL isKanaKey = NO;
 	static int touchesWhenShiting = 0;
 	static BOOL cancelled = NO;
+	static CGFloat gestureSpeed = SS_SPEED_DEFAULT;
 
 	int touchesCount = [gesture numberOfTouches];
 
@@ -121,8 +249,10 @@
 	// Check for shift key being pressed
 	if ([currentLayout respondsToSelector:@selector(SS_shouldSelect)] && !shiftHeldDown) {
 		shiftHeldDown = [currentLayout SS_shouldSelect];
-		isFirstShiftDown = YES;
-		touchesWhenShiting = touchesCount;
+		if (shiftHeldDown) {
+			isFirstShiftDown = YES;
+			touchesWhenShiting = touchesCount;
+		}
 	}
 
 	if ([currentLayout respondsToSelector:@selector(SS_isKanaKey)]) {
@@ -147,7 +277,9 @@
 	//
 	// Start Gesture stuff
 	//
-	if (gesture.state == UIGestureRecognizerStateEnded || gesture.state == UIGestureRecognizerStateCancelled) {
+	if (gesture.state == UIGestureRecognizerStateEnded || gesture.state == UIGestureRecognizerStateCancelled || gesture.state == UIGestureRecognizerStateFailed) {
+		// Clear before the final refresh, so it sees the final caret/selection.
+		self.SS_candidateSession = nil;
 		if (hasStarted) {
 			if ([privateInputDelegate respondsToSelector:@selector(selectedTextRange)]) {
 				UITextRange *range = [privateInputDelegate selectedTextRange];
@@ -182,7 +314,7 @@
 				}
 			}
 
-			// Tell auto correct/suggestions the cursor has moved
+			// Generate suggestions once at the final position after the drag.
 			if ([keyboardImpl respondsToSelector:@selector(updateForChangedSelection)]) {
 				[keyboardImpl updateForChangedSelection];
 			}
@@ -195,17 +327,32 @@
 		handWriting = NO;
 		haveCheckedHand = NO;
 		cancelled = NO;
+		isFirstShiftDown = NO;
+		startingtextRange = nil;
+		pivotPoint = nil;
+		SSResetMovement(&movement);
 
 		touchesCount = 0;
 		touchesWhenShiting = 0;
 		gesture.cancelsTouchesInView = NO;
 	} else if (longPress || handWriting || !privateInputDelegate || isMoreKey || isKanaKey || cancelled) {
+		// If an active drag becomes ineligible, resume normal keyboard handling.
+		if (self.SS_candidateSession) {
+			self.SS_candidateSession = nil;
+			if (privateInputDelegate && [self respondsToSelector:@selector(updateForChangedSelection)])
+				[self updateForChangedSelection];
+		}
 		return;
 	} else if (gesture.state == UIGestureRecognizerStateBegan) {
-		xOffset = 0;
-
-		previousPosition = [gesture locationInView:self];
-		realPreviousPosition = previousPosition;
+		self.SS_candidateSession = nil;
+		SSResetMovement(&movement);
+		pivotPoint = nil;
+		startingtextRange = nil;
+		// Read the shared value on every new swipe, even if a notification was
+		// missed while the app was suspended. Keep it fixed during this swipe.
+		SSReloadSpeed();
+		gestureSpeed = ssSwipeSpeed;
+		previousTranslation = CGPointZero;
 
 		if ([privateInputDelegate respondsToSelector:@selector(selectedTextRange)]) {
 			startingtextRange = [privateInputDelegate selectedTextRange];
@@ -217,8 +364,7 @@
 			currentRange = [privateInputDelegate selectedTextRange];
 		}
 
-		CGPoint position = [gesture locationInView:self];
-		CGPoint delta = CGPointMake(position.x - previousPosition.x, position.y - previousPosition.y);
+		CGPoint translation = [(SSPanGestureRecognizer *)gesture swipeTranslation];
 
 		// Should we even run?
 		CGFloat deadZone = 18;
@@ -227,79 +373,83 @@
 		}
 
 		// If hasn't started, and it's either moved to little or the user swiped up (accents) kill it.
-		if (hasStarted == NO && ABS(delta.y) > deadZone) {
-			if (ABS(delta.y) > ABS(delta.x)) {
+		if (hasStarted == NO && ABS(translation.y) > deadZone) {
+			if (ABS(translation.y) > ABS(translation.x)) {
 				cancelled = YES;
 			}
 		}
-		if ((hasStarted == NO && delta.x < deadZone && delta.x > (-deadZone)) || cancelled) {
+		if ((hasStarted == NO && ABS(translation.x) < deadZone) || cancelled) {
 			return;
 		}
 
 		// We are running so shut other things off/down
 		gesture.cancelsTouchesInView = YES;
+		if (!self.SS_candidateSession) {
+			SSCandidateSession *session = [[SSCandidateSession alloc] init];
+			session.gesture = gesture;
+			session.inputDelegate = privateInputDelegate;
+			self.SS_candidateSession = session;
+			// Retire predictions requested before this drag so a late typing
+			// result cannot repaint the candidate row midway through it.
+			if ([self respondsToSelector:@selector(cancelCandidateRequests)])
+				[self cancelCandidateRequests];
+		}
 		hasStarted = YES;
 
-		// Make x & y positive for comparision
-		CGFloat positiveX = ABS(delta.x);
-
-		// Determine the direction it should be going in
-		UITextDirection textDirection = delta.x < 0 ? UITextStorageDirectionBackward : UITextStorageDirectionForward;
-
-		// Only do these new big 'jumps' if we've moved far enough
-		CGFloat xMinimum = 10;
-
-		CGFloat neededTouches = 2;
+		int neededTouches = 2;
 		if (shiftHeldDown && (touchesWhenShiting >= 2)) {
 			neededTouches = 3;
 		}
 
-		UITextGranularity granularity = UITextGranularityCharacter;
-		// Handle different touches
-		if (touchesCount >= neededTouches) {
-			// make it skip words
-			granularity = UITextGranularityWord;
-			xMinimum = 20;
+		BOOL words = touchesCount >= neededTouches;
+		UITextGranularity granularity = words ? UITextGranularityWord : UITextGranularityCharacter;
+		BOOL extendRange = shiftHeldDown;
+		double deltaX = translation.x - previousTranslation.x;
+		previousTranslation = translation;
+		int steps = SSTakeMovementSteps(&movement, deltaX, gestureSpeed, words);
+		if (!steps) return;
+		BOOL right = steps > 0;
+		int count = abs(steps);
+
+		// WebKit edits selection asynchronously. Send each step once through
+		// its edit-command path; do not also write a stale UITextRange.
+		Class webClass = NSClassFromString(@"WKContentView");
+		if (webClass && [privateInputDelegate isKindOfClass:webClass]) {
+			WKContentView *webView = (WKContentView *)privateInputDelegate;
+			BOOL wordCommands = words &&
+				[webView respondsToSelector:@selector(_moveToStartOfWord:withHistory:)] &&
+				[webView respondsToSelector:@selector(_moveToEndOfWord:withHistory:)];
+			if (!wordCommands && (![webView respondsToSelector:@selector(_moveLeft:withHistory:)] ||
+				![webView respondsToSelector:@selector(_moveRight:withHistory:)])) return;
+			for (int i = 0; i < count; i++) {
+				if (wordCommands) {
+					if (right) [webView _moveToEndOfWord:extendRange withHistory:nil];
+					else [webView _moveToStartOfWord:extendRange withHistory:nil];
+				} else {
+					if (right) [webView _moveRight:extendRange withHistory:nil];
+					else [webView _moveLeft:extendRange withHistory:nil];
+				}
+			}
+			isFirstShiftDown = NO;
+			[self SS_revealSelection:webView];
+			return;
 		}
 
-		// Should we move the cusour or extend the current range.
-		BOOL extendRange = shiftHeldDown;
-
-		static UITextPosition *pivotPoint = nil;
-
-		// Get the new range
+		if (!currentRange) return;
 		UITextPosition *positionStart = currentRange.start;
 		UITextPosition *positionEnd = currentRange.end;
-
-		// The moving position is
-		UITextPosition *_position = nil;
-
-		// If this is the first run we are selecting then pick our pivot point
-		if (isFirstShiftDown) {
-			if (delta.x > 0 || delta.y < -20) {
-				pivotPoint = positionStart;
-			} else {
-				pivotPoint = positionEnd;
-			}
-		}
-
+		if (!positionStart || !positionEnd) return;
+		if (extendRange && (isFirstShiftDown || !pivotPoint))
+			pivotPoint = right ? positionStart : positionEnd;
+		UITextPosition *position = nil;
 		if (extendRange && pivotPoint) {
-			// Find which position isn't our pivot and move that.
 			BOOL startIsPivot = KH_positionsSame(privateInputDelegate, pivotPoint, positionStart);
-			_position = (startIsPivot) ? positionEnd : positionStart;
+			position = startIsPivot ? positionEnd : positionStart;
 		} else {
-			_position = (delta.x > 0) ? positionEnd : positionStart;
-			if (!pivotPoint) pivotPoint = _position;
+			position = right ? positionEnd : positionStart;
 		}
+		isFirstShiftDown = NO;
 
-		// Is it right to left at the current selection point?
-		if ([privateInputDelegate baseWritingDirectionForPosition:_position inDirection:UITextStorageDirectionForward] == UITextWritingDirectionRightToLeft) {
-			// Flip the direction
-			if (textDirection == UITextStorageDirectionForward) textDirection = UITextStorageDirectionBackward;
-			else textDirection = UITextStorageDirectionForward;
-		}
-
-		// Try and get the tockenizer
 		id <UITextInputTokenizer, UITextInput> tokenizer = nil;
 		if ([privateInputDelegate respondsToSelector:@selector(positionFromPosition:toBoundary:inDirection:)]) {
 			tokenizer = privateInputDelegate;
@@ -307,79 +457,43 @@
 			tokenizer = (id <UITextInput, UITextInputTokenizer>)privateInputDelegate.tokenizer;
 		}
 
-		if (tokenizer) {
-			// Move X
-			if (positiveX >= 1) {
-				UITextPosition *_position_old = _position;
-
-				_position = KH_tokenizerMovePositionWithGranularitInDirection(tokenizer, _position, granularity, textDirection);
-
-				// If I tried to move it and got nothing back reset it to what I had.
-				if (!_position) _position = _position_old;
-
-				// If I tried to move it a word at a time and nothing happened
-				if (granularity == UITextGranularityWord && (KH_positionsSame(privateInputDelegate, currentRange.start, _position) && !KH_positionsSame(privateInputDelegate, privateInputDelegate.beginningOfDocument, _position))) {
-					_position = KH_tokenizerMovePositionWithGranularitInDirection(tokenizer, _position, UITextGranularityCharacter, textDirection);
-					xMinimum = 4;
+		if (!tokenizer || !position) return;
+		for (int i = 0; i < count; i++) {
+			UITextDirection direction = right ? UITextStorageDirectionForward : UITextStorageDirectionBackward;
+			if ([privateInputDelegate baseWritingDirectionForPosition:position inDirection:UITextStorageDirectionForward]
+				== UITextWritingDirectionRightToLeft)
+				direction = right ? UITextStorageDirectionBackward : UITextStorageDirectionForward;
+			UITextPosition *next = KH_tokenizerMovePositionWithGranularitInDirection(tokenizer, position, granularity, direction);
+			if (words && (!next || KH_positionsSame(privateInputDelegate, position, next))) {
+				// Some tokenizers return the current word boundary. Cross it
+				// by one grapheme, then continue to the next word boundary.
+				UITextPosition *character = KH_tokenizerMovePositionWithGranularitInDirection(
+					tokenizer, position, UITextGranularityCharacter, direction);
+				if (character && !KH_positionsSame(privateInputDelegate, position, character)) {
+					next = KH_tokenizerMovePositionWithGranularitInDirection(tokenizer, character, granularity, direction);
+					if (!next) next = character;
 				}
-
-				// Another sanity check
-				if (!_position || positiveX < xMinimum) _position = _position_old;
 			}
+			if (!next || KH_positionsSame(privateInputDelegate, position, next)) break;
+			position = next;
 		}
-
-		if (!extendRange && _position) pivotPoint = _position;
-
-		// Get a new text range
-		UITextRange *textRange = startingtextRange = nil;
+		if (!extendRange) pivotPoint = position;
+		if (!pivotPoint) return;
+		UITextRange *textRange = nil;
 		if ([privateInputDelegate respondsToSelector:@selector(textRangeFromPosition:toPosition:)]) {
-			if ([privateInputDelegate comparePosition:_position toPosition:pivotPoint] == NSOrderedAscending) {
-				textRange = [privateInputDelegate textRangeFromPosition:_position toPosition:pivotPoint];
-			} else {
-				textRange = [privateInputDelegate textRangeFromPosition:pivotPoint toPosition:_position];
-			}
+			if ([privateInputDelegate comparePosition:position toPosition:pivotPoint] == NSOrderedAscending)
+				textRange = [privateInputDelegate textRangeFromPosition:position toPosition:pivotPoint];
+			else
+				textRange = [privateInputDelegate textRangeFromPosition:pivotPoint toPosition:position];
 		}
-
-		CGPoint oldPrevious = previousPosition;
-		// Should I change X?
-		if (positiveX > xMinimum) previousPosition = position;
-
-		isFirstShiftDown = NO;
-
-		//
-		// Handle Safari's broken UITextInput support
-		//
-		BOOL webView = [NSStringFromClass([privateInputDelegate class]) isEqualToString:@"WKContentView"];
-		if (webView) {
-			xOffset += (position.x - realPreviousPosition.x);
-
-			if (ABS(xOffset) >= xMinimum) {
-				BOOL positive = (xOffset > 0);
-				int offset = (ABS(xOffset) / xMinimum);
-				BOOL isSelecting = pivotPoint != _position;
-
-				for (int i = 0; i < offset; i++) {
-					if (positive) {
-						[(WKContentView *)privateInputDelegate _moveRight:isSelecting withHistory:nil];
-					} else {
-						[(WKContentView *)privateInputDelegate _moveLeft:isSelecting withHistory:nil];
-					}
-				}
-
-				xOffset += (positive ? -(offset * xMinimum) : (offset * xMinimum));
-			}
-			[self SS_revealSelection:(UIView *)privateInputDelegate];
-		}
-
-		//
-		// Normal text input
-		//
-		if (textRange && (oldPrevious.x != previousPosition.x || oldPrevious.y != previousPosition.y)) {
+		// Commit only the final range for this callback. Selection layout and
+		// keyboard context updates therefore run once even for a fast swipe.
+		if (textRange && (!KH_positionsSame(privateInputDelegate, currentRange.start, textRange.start) ||
+			!KH_positionsSame(privateInputDelegate, currentRange.end, textRange.end))) {
+			startingtextRange = textRange;
 			[privateInputDelegate setSelectedTextRange:textRange];
 			[self SS_revealSelection:(UIView *)privateInputDelegate];
 		}
-
-		realPreviousPosition = position;
 	}
 }
 
@@ -404,18 +518,34 @@
 
 
 %hook UIKeyboardLayoutStar
+%property (nonatomic, strong) SSDeleteSession *SS_deleteSession;
 /*==============touchesBegan================*/
 -(void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
 	UITouch *touch = [touches anyObject];
 
-	UIKBKey *keyObject = [self keyHitTest:[touch locationInView:touch.view]];
+	UIKBKey *keyObject = [self keyHitTest:[touch locationInView:self]];
 	NSString *key = [[keyObject representedString] lowercaseString];
 
-	isDeleteKey = [key isEqualToString:@"delete"];
 	isMoreKey = [key isEqualToString:@"more"];
 	isKanaKey = [kanaKeys containsObject:key];
 
-	g_deleteOnlyOnce = NO;
+	for (UITouch *pressedTouch in touches) {
+		NSString *pressedKey = [[[self keyHitTest:[pressedTouch locationInView:self]] representedString] lowercaseString];
+		if (![pressedKey isEqualToString:@"delete"]) continue;
+		SSClearDeleteSession(self);
+		UIKeyboardImpl *keyboard = SSKeyboardForLayout(self);
+		if (!keyboard) break;
+		SSDeleteSession *session = [[SSDeleteSession alloc] init];
+		session.keyboard = keyboard;
+		session.inputDelegate = SSCurrentInputDelegate(keyboard);
+		session.touch = pressedTouch;
+		// Snapshot once per physical press: native deletion can clear the
+		// final marked character before touchesEnded arrives.
+		session->state = SSBeginDelete(!session.inputDelegate || SSHasComposition(keyboard));
+		self.SS_deleteSession = session;
+		keyboard.SS_deleteSession = session;
+		break;
+	}
 
 	%orig;
 }
@@ -424,7 +554,7 @@
 -(void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
 	UITouch *touch = [touches anyObject];
 
-	UIKBKey *keyObject = [self keyHitTest:[touch locationInView:touch.view]];
+	UIKBKey *keyObject = [self keyHitTest:[touch locationInView:self]];
 	NSString *key = [[keyObject representedString] lowercaseString];
 
 	// Delete key (or the arabic key which is where the shift key would be)
@@ -439,6 +569,8 @@
 
 -(void)touchesCancelled:(id)arg1 withEvent:(id)arg2 {
 	%orig;
+	SSDeleteSession *session = self.SS_deleteSession;
+	if (!session.touch || [arg1 containsObject:session.touch]) SSClearDeleteSession(self);
 
 	shiftByOtherKey = NO;
 	isLongPressed = NO;
@@ -447,25 +579,28 @@
 
 /*==============touchesEnded================*/
 -(void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+	SSDeleteSession *session = self.SS_deleteSession;
+	BOOL endsDelete = session.touch && [touches containsObject:session.touch];
 	%orig;
 
-	isDeleteKey = NO;
-
-	UITouch *touch = [touches anyObject];
-	NSString *key = [[[self keyHitTest:[touch locationInView:touch.view]] representedString] lowercaseString];
-
-	// Delete key
-	if ([key isEqualToString:@"delete"] && !isLongPressed && !isKanaKey) {
-		g_deleteOnlyOnce = YES;
-		g_availableDeleteTimes = 1;
-		UIKeyboardImpl *kb = [UIKeyboardImpl activeInstance];
-		if ([kb respondsToSelector:@selector(handleDelete)]) {
-			[kb handleDelete];
-		} else if ([kb respondsToSelector:@selector(handleDeleteAsRepeat:)]) {
-			[kb handleDeleteAsRepeat:NO];
-		} else if ([kb respondsToSelector:@selector(handleDeleteWithNonZeroInputCount)]) {
-			[kb handleDeleteWithNonZeroInputCount];
+	if (endsDelete) {
+		UIKeyboardImpl *keyboard = session.keyboard;
+		NSString *key = [[[self keyHitTest:[session.touch locationInView:self]] representedString] lowercaseString];
+		BOOL sameInput = keyboard && session.inputDelegate &&
+			session.inputDelegate == SSCurrentInputDelegate(keyboard);
+		BOOL claimedSwipe = keyboard.SS_pan.cancelsTouchesInView || keyboard.SS_candidateSession != nil;
+		if (SSReplayDelete(&session->state, sameInput, [key isEqualToString:@"delete"],
+			claimedSwipe, SSHasComposition(keyboard))) {
+			session->state.replaying = true;
+			if ([keyboard respondsToSelector:@selector(handleDelete)]) {
+				[keyboard handleDelete];
+			} else if ([keyboard respondsToSelector:@selector(handleDeleteAsRepeat:)]) {
+				[keyboard handleDeleteAsRepeat:NO];
+			} else if ([keyboard respondsToSelector:@selector(handleDeleteWithNonZeroInputCount)]) {
+				[keyboard handleDeleteWithNonZeroInputCount];
+			}
 		}
+		SSClearDeleteSession(self);
 	}
 
 	shiftByOtherKey = NO;
@@ -497,15 +632,16 @@
 	return isLongPressed;
 }
 
-// Legacy support (doesn't effect iOS 7 + so harmless leaving in & helps iOS 6)
 -(void)handleDelete {
-	if (!(!isLongPressed && isDeleteKey)) %orig;
+	SSDeleteSession *session = SSCurrentDeleteSession(self);
+	if (!SSDeferLegacyDelete(session ? &session->state : NULL)) %orig;
 }
 
 -(void)handleDeleteAsRepeat:(BOOL)repeat executionContext:(UIKeyboardTaskExecutionContext *)executionContext {
 	// Long press is simply meant to indicate if it's should repeat delete so repeat will do.
 	isLongPressed = repeat;
-	if ((!isLongPressed && isDeleteKey) || (g_deleteOnlyOnce && g_availableDeleteTimes <= 0)) {
+	SSDeleteSession *session = SSCurrentDeleteSession(self);
+	if (SSDeferDelete(session ? &session->state : NULL, repeat)) {
 		if ([[self _layout] respondsToSelector:@selector(idiom)]) {
 			if ([(UIKeyboardLayout *)[self _layout] idiom] == 2) {
 				[[UIDevice currentDevice] _playSystemSound:1123LL];
@@ -521,8 +657,6 @@
 		return;
 	}
 
-	if (g_deleteOnlyOnce) g_availableDeleteTimes--;
-
 	%orig;
 }
 %end
@@ -537,12 +671,99 @@
 %end
 
 
+%group SSNativeCandidatePolicy
+%hook UIKeyboardImpl
+-(BOOL)shouldGenerateCandidatesAfterSelectionChange {
+	if (SSDeferCandidatesForKeyboard(self)) return NO;
+	return %orig;
+}
+%end
+%end
+
+%group SSSelectionRefreshFallback
+%hook UIKeyboardImpl
+-(void)updateForChangedSelection {
+	if (SSDeferCandidatesForKeyboard(self)) return;
+	%orig;
+}
+%end
+%end
+
+// Web input can request candidates after text/context synchronization rather
+// than through shouldGenerateCandidatesAfterSelectionChange. Gate the request
+// entry points too. No result callback or execution-context method is dropped.
+%group SSCandidateRequest
+%hook UIKeyboardImpl
+-(void)generateCandidates {
+	if (SSDeferCandidatesForKeyboard(self)) return;
+	%orig;
+}
+%end
+%end
+
+%group SSCandidateRequestWithOptions
+%hook UIKeyboardImpl
+-(void)generateCandidatesWithOptions:(int)options {
+	if (SSDeferCandidatesForKeyboard(self)) return;
+	%orig;
+}
+%end
+%end
+
+%group SSAsyncCandidateRequest
+%hook UIKeyboardImpl
+-(void)generateCandidatesAsynchronously {
+	if (SSDeferCandidatesForKeyboard(self)) return;
+	%orig;
+}
+%end
+%end
+
+%group SSAsyncCandidateRequestWithRange
+%hook UIKeyboardImpl
+-(void)generateCandidatesAsynchronouslyWithRange:(NSRange)range selectedCandidate:(id)candidate {
+	if (SSDeferCandidatesForKeyboard(self)) return;
+	%orig;
+}
+%end
+%end
+
 %ctor {
 	NSString *path = [[NSProcessInfo processInfo] arguments][0];
 	BOOL isApp = [path rangeOfString:@"/Application"].location != NSNotFound;
 	BOOL isSpringBoard = [path rangeOfString:@"SpringBoard.app"].location != NSNotFound;
 	if (isApp || isSpringBoard) {
+		// SpringBoard seeds notifyd from disk after each respring/reboot and
+		// retains a registration while sandboxed apps read the shared state.
+		if (isSpringBoard) SSPublishSavedSpeed();
+		SSReloadSpeed();
+		CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+			NULL, SSPreferencesDidChange, SSPreferencesChanged, NULL,
+			CFNotificationSuspensionBehaviorDeliverImmediately);
+		// Refresh after suspension even if a Darwin notification was missed.
+		[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+			object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+				SSReloadSpeed();
+			}];
 		kanaKeys = [NSSet setWithArray:@[@"あ",@"か",@"さ",@"た",@"な",@"は",@"ま",@"や",@"ら",@"わ",@"、"]];
 		%init;
+		Class keyboardClass = objc_getClass("UIKeyboardImpl");
+		if (SSHasNoArgumentMethod(keyboardClass, @selector(shouldGenerateCandidatesAfterSelectionChange), YES)) {
+			%init(SSNativeCandidatePolicy);
+		} else if (SSHasNoArgumentMethod(keyboardClass, @selector(updateForChangedSelection), NO)) {
+			%init(SSSelectionRefreshFallback);
+		}
+		if (SSHasVoidMethod(keyboardClass, @selector(generateCandidates), NULL, NULL)) {
+			%init(SSCandidateRequest);
+		}
+		if (SSHasVoidMethod(keyboardClass, @selector(generateCandidatesWithOptions:), @encode(int), NULL)) {
+			%init(SSCandidateRequestWithOptions);
+		}
+		if (SSHasVoidMethod(keyboardClass, @selector(generateCandidatesAsynchronously), NULL, NULL)) {
+			%init(SSAsyncCandidateRequest);
+		}
+		if (SSHasVoidMethod(keyboardClass, @selector(generateCandidatesAsynchronouslyWithRange:selectedCandidate:), @encode(NSRange), @encode(id))) {
+			%init(SSAsyncCandidateRequestWithRange);
+		}
 	}
 }

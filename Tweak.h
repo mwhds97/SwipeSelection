@@ -1,6 +1,14 @@
 #import "SSPanGestureRecognizer.h"
 
 @class UIKeyboardTaskExecutionContext;
+@class SSCandidateSession;
+@class SSDeleteSession;
+
+@interface TIKeyboardInputManagerState : NSObject
+@property (nonatomic, readonly) BOOL usesCandidateSelection;
+@property (nonatomic, readonly) unsigned long long inputCount;
+@property (nonatomic, readonly, copy) NSString *inputString;
+@end
 
 @interface UIKeyboardTaskQueue : NSObject
 @property(retain, nonatomic) UIKeyboardTaskExecutionContext *executionContext;
@@ -103,6 +111,7 @@
 @end
 
 @interface UIKeyboardLayoutStar : UIKeyboardLayout
+@property (nonatomic, strong) SSDeleteSession *SS_deleteSession;
 -(id)keyHitTest:(CGPoint)arg1;
 -(id)keyHitTestWithoutCharging:(CGPoint)arg1;
 -(id)keyHitTestClosestToPoint:(CGPoint)arg1;
@@ -117,7 +126,10 @@
 @interface UIKeyboardImpl : UIView
 @property (readonly, assign, nonatomic) UIResponder <UITextInputPrivate> *privateInputDelegate;
 @property (readonly, assign, nonatomic) UIResponder <UITextInput> *inputDelegate;
+@property (readonly, nonatomic) TIKeyboardInputManagerState *inputManagerState;
 @property (nonatomic,strong) UIPanGestureRecognizer *SS_pan;
+@property (nonatomic,strong) SSCandidateSession *SS_candidateSession;
+@property (nonatomic,strong) SSDeleteSession *SS_deleteSession;
 @property (nonatomic,retain) id feedbackBehavior; // iOS 10
 @property (nonatomic,retain) id feedbackGenerator; // iOS11 12
 +(UIKeyboardImpl *)sharedInstance;
@@ -130,6 +142,8 @@
 -(void)handleDeleteWithNonZeroInputCount;
 -(void)stopAutoDelete;
 -(BOOL)handwritingPlane;
+-(BOOL)hasMarkedText;
+-(void)cancelCandidateRequests;
 -(void)updateForChangedSelection;
 -(void)playKeyClickSound:(BOOL)arg1; // iOS 13
 -(void)playDeleteKeyFeedback:(BOOL)arg1; // iOS 14
@@ -160,6 +174,8 @@
 -(void)moveByOffset:(NSInteger)offset;
 -(id)_moveLeft:(BOOL)arg1 withHistory:(id)arg2;
 -(id)_moveRight:(BOOL)arg1 withHistory:(id)arg2;
+-(id)_moveToStartOfWord:(BOOL)arg1 withHistory:(id)arg2;
+-(id)_moveToEndOfWord:(BOOL)arg1 withHistory:(id)arg2;
 @end
 
 @interface UIResponder()
@@ -204,9 +220,6 @@ BOOL KH_positionsSame(id <UITextInput, UITextInputTokenizer> tokenizer, UITextPo
 
 static BOOL shiftByOtherKey = NO;
 static BOOL isLongPressed = NO;
-static BOOL isDeleteKey = NO;
 static BOOL isMoreKey = NO;
 static BOOL isKanaKey = NO;
-static BOOL g_deleteOnlyOnce;
-static int g_availableDeleteTimes;
 static NSSet *kanaKeys;

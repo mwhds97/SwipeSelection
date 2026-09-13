@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>title</key><string>SwipeSelection</string>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key><string>PSGroupCell</string>
+            <key>label</key><string>Swipe speed</string>
+            <key>footerText</key><string>0.10×–2.00×. 1.00× is the original speed. Higher values move the cursor faster. Changes apply automatically.</string>
+        </dict>
+        <dict>
+            <key>cell</key><string>PSStaticTextCell</string>
+            <key>cellClass</key><string>SSSpeedCell</string>
+            <key>id</key><string>SwipeSpeed</string>
+            <key>height</key><integer>64</integer>
+        </dict>
+    </array>
+</dict>
+</plist>
