@@ -58,6 +58,50 @@ int main(void) {
     assert(!SSDeferDelete(NULL, false));
     assert(!SSDeferDelete(NULL, true));
     assert(!SSReplayDelete(NULL, true, true, false, false));
-    puts("PASS: native composition deletion, final marked character, deferred taps, repeat, selection, and separate presses");
+
+    // Regression: Pinyin Delete begins natively. After a swipe takes over,
+    // its repeat must not enter UIKit with the selection moved elsewhere.
+    for (int native = 0; native <= 1; native++) {
+        SSDeleteState drag = SSBeginDelete(native);
+        assert(!SSCancelDeleteCallback(&drag, false, false));
+        assert(SSDeferDelete(&drag, false) == !native);
+        SSCancelDeleteForSwipe(&drag);
+        assert(SSCancelDeleteCallback(&drag, true, true));
+        assert(SSCancelDeleteCallback(&drag, false, true));
+        assert(SSDeferDelete(&drag, true));
+        assert(SSDeferLegacyDelete(&drag));
+        assert(!SSReplayDelete(&drag, true, true, false, false));
+
+        // UIKit cancels the original key touch after the recognizer wins.
+        // Queued repeats remain cancelled even after the pan ends, without
+        // relying on the UITouch still existing or candidates being visible.
+        SSReleaseDelete(&drag);
+        for (int i = 0; i < 10; i++)
+            assert(SSCancelDeleteCallback(&drag, true, false));
+        assert(!SSReplayDelete(&drag, true, true, false, false));
+
+        // A new hardware/non-touch Delete sequence is usable immediately.
+        assert(!SSCancelDeleteCallback(&drag, false, false));
+        assert(!SSDeferDelete(&drag, false));
+        assert(!SSCancelDeleteCallback(&drag, true, false));
+        assert(!SSDeferDelete(&drag, true));
+
+        // A fresh on-screen press always replaces the cancelled state.
+        SSCancelDeleteForSwipe(&drag);
+        drag = SSBeginDelete(true);
+        assert(!SSCancelDeleteCallback(&drag, false, false));
+        assert(!SSDeferDelete(&drag, false));
+    }
+    SSDeleteState cancelled = SSBeginDelete(true);
+    assert(SSCancelDeleteCallback(&cancelled, false, true));
+    assert(SSCancelDeleteCallback(&cancelled, true, false));
+    assert(SSCancelDeleteCallback(&cancelled, false, false));
+    assert(SSCancelDeleteCallback(NULL, true, true));
+    assert(!SSCancelDeleteCallback(NULL, true, false));
+    SSDeleteState independent = SSBeginDelete(true);
+    assert(!SSCancelDeleteCallback(&independent, true, false));
+    assert(!SSDeferDelete(&independent, true));
+
+    puts("PASS: native composition taps, swipe cancellation, queued repeats after release, fresh/hardware presses, independent keyboards, and deferred tap replay");
     return 0;
 }

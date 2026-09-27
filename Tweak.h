@@ -3,6 +3,7 @@
 @class UIKeyboardTaskExecutionContext;
 @class SSCandidateSession;
 @class SSDeleteSession;
+@class SSPanSession;
 
 @interface TIKeyboardInputManagerState : NSObject
 @property (nonatomic, readonly) BOOL usesCandidateSelection;
@@ -130,6 +131,7 @@
 @property (nonatomic,strong) UIPanGestureRecognizer *SS_pan;
 @property (nonatomic,strong) SSCandidateSession *SS_candidateSession;
 @property (nonatomic,strong) SSDeleteSession *SS_deleteSession;
+@property (nonatomic,strong) SSPanSession *SS_panSession;
 @property (nonatomic,retain) id feedbackBehavior; // iOS 10
 @property (nonatomic,retain) id feedbackGenerator; // iOS11 12
 +(UIKeyboardImpl *)sharedInstance;
